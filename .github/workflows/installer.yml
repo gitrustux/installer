@@ -1,0 +1,355 @@
+name: Build Rustica OS Installers
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'kernel/**'
+      - 'apps/**'
+      - 'installer/**'
+      - '.github/workflows/installer.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'kernel/**'
+      - 'apps/**'
+      - 'installer/**'
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'Architecture to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - amd64
+          - arm64
+          - riscv64
+      validate:
+        description: 'Run QEMU validation'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  RUSTICA_VERSION: 0.1.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      should-build: ${{ steps.check.outputs.should-build }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check if installer build needed
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should-build=true" >> $GITHUB_OUTPUT
+          else
+            # Check if installer files changed
+            if git diff --name-only HEAD~1 HEAD | grep -E 'kernel|apps|installer'; then
+              echo "should-build=true" >> $GITHUB_OUTPUT
+            else
+              echo "should-build=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  build-amd64:
+    needs: setup
+    if: needs.setup.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            grub-pc-bin \
+            grub-efi-amd64 \
+            grub2-common \
+            xorriso \
+            qemu-system-x86 \
+            mtools \
+            parted \
+            dosfstools \
+            cpio \
+            gzip \
+            util-linux
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: /var/www/rustux.com/prod/target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build kernel
+        run: |
+          cd /var/www/rustux.com/prod/kernel
+          cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build applications
+        run: |
+          cd /var/www/rustux.com/prod/apps
+          cargo build --release --workspace
+
+      - name: Build installer
+        run: |
+          cd /var/www/rustux.com/prod/installer/scripts
+          ./build-all.sh amd64
+
+      - name: Validate with QEMU
+        if: github.event.inputs.validate == 'true' || github.ref == 'refs/heads/main'
+        run: |
+          cd /var/www/rustux.com/prod/installer/validation
+          ./qemu-test.sh amd64
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: rustica-installer-amd64
+          path: /var/www/rustux.com/prod/installer/images/*.iso
+          retention-days: 7
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v3
+        with:
+          name: rustica-installer-amd64-checksums
+          path: /var/www/rustux.com/prod/installer/images/*.sha256
+          retention-days: 7
+
+  build-arm64:
+    needs: setup
+    if: needs.setup.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [arm64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            qemu-system-arm \
+            u-boot-tools \
+            mtools \
+            parted \
+            dosfstools \
+            cpio \
+            gzip \
+            util-linux \
+            gcc-aarch64-linux-gnu
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: /var/www/rustux.com/prod/target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build kernel
+        run: |
+          cd /var/www/rustux.com/prod/kernel
+          cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Build applications
+        run: |
+          cd /var/www/rustux.com/prod/apps
+          cargo build --release --workspace
+
+      - name: Build installer
+        run: |
+          cd /var/www/rustux.com/prod/installer/scripts
+          ./build-all.sh arm64
+
+      - name: Validate with QEMU
+        if: github.event.inputs.validate == 'true' || github.ref == 'refs/heads/main'
+        run: |
+          cd /var/www/rustux.com/prod/installer/validation
+          ./qemu-test.sh arm64
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: rustica-installer-arm64
+          path: /var/www/rustux.com/prod/installer/images/*.img
+          retention-days: 7
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v3
+        with:
+          name: rustica-installer-arm64-checksums
+          path: /var/www/rustux.com/prod/installer/images/*.sha256
+          retention-days: 7
+
+  build-riscv64:
+    needs: setup
+    if: needs.setup.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [riscv64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            qemu-system-riscv64 \
+            mtools \
+            parted \
+            dosfstools \
+            cpio \
+            gzip \
+            util-linux \
+            gcc-riscv64-linux-gnu
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          targets: riscv64gc-unknown-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: /var/www/rustux.com/prod/target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build kernel
+        run: |
+          cd /var/www/rustux.com/prod/kernel
+          cargo build --release --target riscv64gc-unknown-linux-gnu
+
+      - name: Build applications
+        run: |
+          cd /var/www/rustux.com/prod/apps
+          cargo build --release --workspace
+
+      - name: Build installer
+        run: |
+          cd /var/www/rustux.com/prod/installer/scripts
+          ./build-all.sh riscv64
+
+      - name: Validate with QEMU
+        if: github.event.inputs.validate == 'true' || github.ref == 'refs/heads/main'
+        run: |
+          cd /var/www/rustux.com/prod/installer/validation
+          ./qemu-test.sh riscv64
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: rustica-installer-riscv64
+          path: /var/www/rustux.com/prod/installer/images/*.img
+          retention-days: 7
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v3
+        with:
+          name: rustica-installer-riscv64-checksums
+          path: /var/www/rustux.com/prod/installer/images/*.sha256
+          retention-days: 7
+
+  release:
+    needs: [build-amd64, build-arm64, build-riscv64]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Create release bundle
+        run: |
+          mkdir -p release
+          cp rustica-installer-*/*.{iso,img,sha256} release/ 2>/dev/null || true
+          cd release
+          sha256sum *.{iso,img} > SHA256SUMS
+          cd ..
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v3
+        with:
+          name: rustica-installers-release
+          path: release/
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

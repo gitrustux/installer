@@ -1,0 +1,20 @@
+# Build directories
+build/
+images/
+
+# Temporary files
+*.log
+*.tmp
+
+# QEMU test logs
+/tmp/qemu-*-boot.log
+
+# Editor files
+*.swp
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
