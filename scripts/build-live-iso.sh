@@ -176,9 +176,14 @@ This is a bootable Rustica OS live image containing:
 - All CLI tools (ping, ip, fwctl, dnslookup, editor, ssh, etc.)
 - Package manager (rpg)
 
-To install Rustica OS:
+Boot Modes:
+- [1] Install to device: Permanent installation to disk
+- [2] Try Out: Live mode running in RAM (changes lost on reboot)
+- [3] Portable: Persistent mode (changes saved to USB)
+
+To use:
 1. Boot from this image
-2. Run: sudo /bin/rustux-install
+2. Select your preferred mode
 3. Follow the prompts
 
 For more information, visit: https://rustux.com
