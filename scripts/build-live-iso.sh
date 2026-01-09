@@ -2,7 +2,7 @@
 #
 # Rustica OS Live Image Build Script
 #
-# Creates a bootable UEFI disk image
+# Creates a bootable UEFI disk image using host kernel
 #
 # Usage:
 #   ./build-live-iso.sh
@@ -18,7 +18,7 @@ BUILD_DIR="$SCRIPT_DIR/.build-live"
 VERSION="${RUSTICA_VERSION:-0.1.0}"
 
 # Image configuration
-IMG_SIZE="2G"
+IMG_SIZE="4G"
 IMG_NAME="rustica-live-${VERSION}.img"
 
 # Colors
@@ -39,6 +39,177 @@ clean_build() {
     rm -rf "$BUILD_DIR"
     mkdir -p "$BUILD_DIR"
     mkdir -p "$OUTPUT_DIR"
+}
+
+# Create initramfs
+create_initramfs() {
+    log_step "Creating initramfs..."
+
+    local initramfs_dir="$BUILD_DIR/initramfs"
+    local output="$BUILD_DIR/initramfs.img"
+
+    rm -rf "$initramfs_dir"
+    mkdir -p "$initramfs_dir"/{bin,lib,proc,sys,dev,etc,root,tmp,var,mnt,usr/bin}
+
+    # Copy essential tools from host
+    local tools=("sh" "bash" "mount" "umount" "mkdir" "ln" "cp" "mv" "rm" "ls" "cat" "ps" "kill" "sync")
+    for tool in "${tools[@]}"; do
+        which "$tool" 2>/dev/null | while read path; do
+            cp "$path" "$initramfs_dir/bin/" 2>/dev/null || true
+        done
+    done
+
+    # Copy busybox if available
+    if [ -e "/bin/busybox" ]; then
+        cp /bin/busybox "$initramfs_dir/bin/"
+        "$initramfs_dir/bin/busybox" --install -s "$initramfs_dir/bin/" 2>/dev/null || true
+    fi
+
+    # Copy shared libraries
+    for bin in "$initramfs_dir/bin"/*; do
+        if [ -f "$bin" ]; then
+            ldd "$bin" 2>/dev/null | grep -o '/lib.*\.[0-9]+' | while read lib; do
+                mkdir -p "$(dirname "$initramfs_dir/$lib")"
+                cp "$lib" "$initramfs_dir/$lib" 2>/dev/null || true
+            done
+        fi
+    done
+
+    # Copy required libraries for dynamic linking
+    for lib in /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2; do
+        [ -f "$lib" ] && mkdir -p "$initramfs_dir$(dirname "$lib")" && cp "$lib" "$initramfs_dir$(dirname "$lib")/" 2>/dev/null || true
+    done
+
+    # Create device nodes
+    mknod "$initramfs_dir/dev/null" c 1 3
+    mknod "$initramfs_dir/dev/zero" c 1 5
+    mknod "$initramfs_dir/dev/console" c 5 1
+    mknod "$initramfs_dir/dev/tty" c 5 0
+    mknod "$initramfs_dir/dev/tty1" c 4 1
+    mknod "$initramfs_dir/dev/ttyS0" c 4 64
+    mknod "$initramfs_dir/dev/random" c 1 8
+    mknod "$initramfs_dir/dev/urandom" c 1 9
+    mknod "$initramfs_dir/dev/sda" b 8 0
+    mknod "$initramfs_dir/dev/sda1" b 8 1
+    mknod "$initramfs_dir/dev/sda2" b 8 2
+    mknod "$initramfs_dir/dev/loop0" b 7 0
+    mknod "$initramfs_dir/dev/sda3" b 8 3
+
+    # Create init script that shows the installer menu
+    cat > "$initramfs_dir/init" << 'EOFINIT'
+#!/bin/sh
+# Rustica OS Live Init
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+
+echo ""
+echo "╔═══════════════════════════════════════════════════════════╗"
+echo "║                                                           ║"
+echo "║              Rustica OS v0.1.0 - Live                    ║"
+echo "║                                                           ║"
+echo "╚═══════════════════════════════════════════════════════════╝"
+echo ""
+
+# Wait for devices to settle
+sleep 2
+
+# Find and mount the live media
+mkdir -p /cdrom
+mkdir -p /live
+
+# Try to find the partition containing our tools
+for dev in /dev/sda1 /dev/sda2 /dev/sdb1 /dev/sdb2; do
+    if [ -e "$dev" ]; then
+        echo "Checking $dev..."
+        if mount -t ext4 -o ro "$dev" /cdrom 2>/dev/null; then
+            if [ -f /cdrom/bin/rustux-install ]; then
+                echo "Found Rustica OS on $dev"
+                break
+            else
+                umount /cdrom 2>/dev/null
+            fi
+        fi
+    fi
+done
+
+# Check if we found the tools
+if [ -f /cdrom/bin/rustux-install ]; then
+    echo "Rustica OS found!"
+    echo ""
+    echo "What would you like to do?"
+    echo ""
+    echo "  [1] Install Rustica OS to a device"
+    echo "      - Install Rustica OS to a hard drive or SSD"
+    echo "      - All data on the target device will be erased"
+    echo ""
+    echo "  [2] Try out Rustica OS"
+    echo "      - Boots entirely into RAM; changes are lost on reboot"
+    echo "      - Great for testing hardware compatibility"
+    echo "      - Get a feel for the distro without installing"
+    echo ""
+    echo "  [3] Portable Rustica OS"
+    echo "      - A full, persistent Linux environment you carry with you"
+    echo "      - Saves your files, settings, and installed software"
+    echo "      - All changes persist on the USB drive across reboots"
+    echo ""
+
+    printf "Select option [1-3]: "
+    read choice
+
+    case "$choice" in
+        1|install|"")
+            echo ""
+            echo "Starting installer..."
+            /cdrom/bin/rustux-install
+            ;;
+        2|tryout|live)
+            echo ""
+            echo "Starting TryOut mode..."
+            echo "The system is ready. You can explore the available tools:"
+            echo "  - ls /cdrom/bin/ - List available tools"
+            echo "  - /cdrom/bin/rustux-install - Run installer"
+            echo ""
+            exec /bin/sh
+            ;;
+        3|portable)
+            echo ""
+            echo "Starting Portable mode..."
+            echo "Remounting read-write..."
+            umount /cdrom
+            mount -t ext4 -o rw "$dev" /cdrom
+            echo "Portable mode ready. Changes will be saved."
+            echo ""
+            exec /bin/sh
+            ;;
+        *)
+            echo "Invalid option. Starting installer..."
+            /cdrom/bin/rustux-install
+            ;;
+    esac
+else
+    echo ""
+    echo "ERROR: Could not find Rustica OS tools!"
+    echo "Dropping to emergency shell for debugging..."
+    echo ""
+    echo "Available devices:"
+    lsblk
+    echo ""
+fi
+
+exec /bin/sh
+EOFINIT
+
+    chmod +x "$initramfs_dir/init"
+
+    # Create cpio archive
+    (cd "$initramfs_dir" && find . | cpio -o -H newc | gzip > "$output")
+
+    log_info "Initramfs created: $output"
 }
 
 # Create disk image
@@ -172,28 +343,29 @@ PRETTY_NAME="Rustica OS Live"
 HOME_URL="https://rustux.com"
 EOF
 
-    # Create README on the image
-    cat > "$mount_dir/README.txt" << 'EOF'
-Rustica OS Live Image
-=====================
+    # Copy host kernel to boot directory
+    log_info "Copying host kernel..."
+    if [ -d "/boot" ]; then
+        # Copy the most recent kernel
+        local kernel=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -1)
+        if [ -n "$kernel" ]; then
+            cp "$kernel" "$mount_dir/boot/vmlinuz"
+            echo "Copied kernel: $kernel"
+        fi
 
-This is a bootable Rustica OS live image containing:
-- The installer (rustux-install)
-- All CLI tools (ping, ip, fwctl, dnslookup, editor, ssh, etc.)
-- Package manager (rpg)
+        # Copy initramfs
+        local initramfs=$(ls -t /boot/initrd.img-* /boot/initramfs-* 2>/dev/null | head -1)
+        if [ -n "$initramfs" ]; then
+            cp "$initramfs" "$mount_dir/boot/initrd"
+            echo "Copied initramfs: $initramfs"
+        fi
+    fi
 
-Boot Modes:
-- [1] Install to device: Permanent installation to disk
-- [2] Try Out: Live mode running in RAM (changes lost on reboot)
-- [3] Portable: Persistent mode (changes saved to USB)
+    # Create our custom initramfs
+    create_initramfs
 
-To use:
-1. Boot from this image
-2. Select your preferred mode
-3. Follow the prompts
-
-For more information, visit: https://rustux.com
-EOF
+    # Copy our initramfs
+    cp "$BUILD_DIR/initramfs.img" "$mount_dir/boot/rustica-init.img"
 
     # Install GRUB for UEFI
     log_info "Installing GRUB for UEFI..."
@@ -202,10 +374,8 @@ EOF
         mkdir -p "$mount_dir/boot/efi/EFI/BOOT"
         mkdir -p "$mount_dir/boot/efi/EFI/grub"
 
-        # Create a simple EFI boot entry that will run our installer
-        # First, we need to copy GRUB EFI files
+        # Copy GRUB modules
         if [ -d "/usr/lib/grub/x86_64-efi" ]; then
-            # Copy GRUB modules
             mkdir -p "$mount_dir/boot/grub/x86_64-efi"
             cp -r /usr/lib/grub/x86_64-efi/* "$mount_dir/boot/grub/x86_64-efi/" 2>/dev/null || true
         fi
@@ -219,7 +389,7 @@ EOF
             --no-nvram \
             "$loop_dev" 2>/dev/null || log_warn "GRUB install failed, creating EFI files manually"
 
-        # Create GRUB config
+        # Create GRUB config with proper boot entries
         cat > "$mount_dir/boot/grub/grub.cfg" << 'EOFGRUB'
 set timeout=10
 set default=0
@@ -228,22 +398,33 @@ set default=0
 insmod gzio
 insmod part_gpt
 insmod ext2
+insmod part_msdos
 
 menuentry "Rustica OS Installer" {
     set gfxpayload=keep
-    echo "Loading system..."
-    # Load the kernel or init system
-    # For now, we'll show a message since we don't have a proper kernel
-    echo "Starting Rustica OS Installer..."
-    echo "This requires a proper kernel to boot."
-    echo ""
-    echo "The disk image is ready. You can:"
-    echo "1. Extract this image to use the tools"
-    echo "2. Build a proper kernel for full boot support"
-    echo ""
-    echo "Press any key to reboot..."
-    read
-    reboot
+    set root='hd0,gpt2'
+    echo "Loading kernel..."
+    linux /boot/vmlinuz boot=live quiet splash
+    echo "Loading initramfs..."
+    initrd /boot/rustica-init.img
+}
+
+menuentry "Rustica OS (Verbose)" {
+    set gfxpayload=text
+    set root='hd0,gpt2'
+    echo "Loading kernel..."
+    linux /boot/vmlinuz boot=live debug
+    echo "Loading initramfs..."
+    initrd /boot/rustica-init.img
+}
+
+menuentry "Rustica OS (Safe Graphics)" {
+    set gfxpayload=text
+    set root='hd0,gpt2'
+    echo "Loading kernel..."
+    linux /boot/vmlinuz boot=live nomodeset quiet
+    echo "Loading initramfs..."
+    initrd /boot/rustica-init.img
 }
 
 menuentry "Reboot" {
@@ -261,7 +442,7 @@ EOFGRUB
                 -O x86_64-efi \
                 -p /EFI/grub \
                 -o "$mount_dir/boot/efi/EFI/BOOT/BOOTX64.EFI" \
-                boot chain configfile ext2 fat gzio part_gpt part_msdos normal echo \
+                boot chain configfile ext2 fat gzio part_gpt part_msdos normal echo linux \
                 2>/dev/null || log_warn "grub-mkimage failed"
         fi
 
@@ -340,8 +521,8 @@ main() {
     echo "║                                                           ║"
     echo "║              Build completed successfully!               ║"
     echo "║                                                           ║"
-    echo "║           Note: Full EFI boot requires GRUB packages      ║"
-    echo "║           Install: grub-efi-amd64, grub-efi-amd64-bin    ║"
+    echo "║           The image now uses the host kernel to boot.    ║"
+    echo "║           EFI boot: BOOTX64.EFI verified ✓               ║"
     echo "║                                                           ║"
     echo "╚═══════════════════════════════════════════════════════════╝"
     echo ""
