@@ -2,8 +2,7 @@
 #
 # Rustica OS Live Image Build Script
 #
-# Creates a bootable disk image that can be written to USB
-# The image contains the installer and all Rustica OS tools
+# Creates a bootable UEFI disk image
 #
 # Usage:
 #   ./build-live-iso.sh
@@ -51,10 +50,12 @@ create_disk_image() {
     # Create raw disk image
     dd if=/dev/zero of="$img_path" bs=1 count=0 seek="$IMG_SIZE" 2>/dev/null
 
-    # Create partition table
-    parted "$img_path" mklabel msdos 2>/dev/null || true
-    parted "$img_path" mkpart primary ext4 1MiB 100% 2>/dev/null || true
-    parted "$img_path" set 1 boot on 2>/dev/null || true
+    # Create GPT partition table with EFI System Partition and root partition
+    log_info "Creating partitions..."
+    parted "$img_path" mklabel gpt 2>/dev/null || true
+    parted "$img_path" mkpart primary fat32 1MiB 512MiB 2>/dev/null || true
+    parted "$img_path" set 1 esp on 2>/dev/null || true
+    parted "$img_path" mkpart primary ext4 512MiB 100% 2>/dev/null || true
 
     # Setup loop device
     local loop_dev
@@ -62,20 +63,25 @@ create_disk_image() {
     partprobe "$loop_dev" 2>/dev/null || true
     sleep 1
 
-    # Format partition
-    log_info "Formatting partition..."
-    mkfs.ext4 -F "${loop_dev}p1" 2>/dev/null
+    # Format partitions
+    log_info "Formatting partitions..."
+    mkfs.vfat -F32 "${loop_dev}p1" 2>/dev/null
+    mkfs.ext4 -F "${loop_dev}p2" 2>/dev/null
 
-    # Mount partition
+    # Mount partitions
     local mount_dir="$BUILD_DIR/mount"
     mkdir -p "$mount_dir"
-    mount "${loop_dev}p1" "$mount_dir" 2>/dev/null
+    mount "${loop_dev}p2" "$mount_dir" 2>/dev/null
+    mkdir -p "$mount_dir/boot/efi"
+    mount "${loop_dev}p1" "$mount_dir/boot/efi" 2>/dev/null
 
     # Create rootfs structure
     log_step "Creating rootfs..."
     mkdir -p "$mount_dir"/{bin,boot,dev,etc,home,proc,root,run,srv,sys,tmp,var,opt}
     mkdir -p "$mount_dir"/usr/{bin,sbin,lib,share}
     mkdir -p "$mount_dir"/var/{lib,cache,log,run}
+    mkdir -p "$mount_dir"/boot/efi/EFI
+    mkdir -p "$mount_dir"/boot/grub
 
     # Build tools if needed
     log_info "Building tools..."
@@ -189,9 +195,117 @@ To use:
 For more information, visit: https://rustux.com
 EOF
 
+    # Install GRUB for UEFI
+    log_info "Installing GRUB for UEFI..."
+    if command -v grub-install &> /dev/null; then
+        # Create EFI directory structure
+        mkdir -p "$mount_dir/boot/efi/EFI/BOOT"
+        mkdir -p "$mount_dir/boot/efi/EFI/grub"
+
+        # Create a simple EFI boot entry that will run our installer
+        # First, we need to copy GRUB EFI files
+        if [ -d "/usr/lib/grub/x86_64-efi" ]; then
+            # Copy GRUB modules
+            mkdir -p "$mount_dir/boot/grub/x86_64-efi"
+            cp -r /usr/lib/grub/x86_64-efi/* "$mount_dir/boot/grub/x86_64-efi/" 2>/dev/null || true
+        fi
+
+        # Install GRUB
+        grub-install \
+            --target=x86_64-efi \
+            --efi-directory="$mount_dir/boot/efi" \
+            --boot-directory="$mount_dir/boot" \
+            --removable \
+            --no-nvram \
+            "$loop_dev" 2>/dev/null || log_warn "GRUB install failed, creating EFI files manually"
+
+        # Create GRUB config
+        cat > "$mount_dir/boot/grub/grub.cfg" << 'EOFGRUB'
+set timeout=10
+set default=0
+
+# Load necessary modules
+insmod gzio
+insmod part_gpt
+insmod ext2
+
+menuentry "Rustica OS Installer" {
+    set gfxpayload=keep
+    echo "Loading system..."
+    # Load the kernel or init system
+    # For now, we'll show a message since we don't have a proper kernel
+    echo "Starting Rustica OS Installer..."
+    echo "This requires a proper kernel to boot."
+    echo ""
+    echo "The disk image is ready. You can:"
+    echo "1. Extract this image to use the tools"
+    echo "2. Build a proper kernel for full boot support"
+    echo ""
+    echo "Press any key to reboot..."
+    read
+    reboot
+}
+
+menuentry "Reboot" {
+    reboot
+}
+
+menuentry "Power Off" {
+    halt
+}
+EOFGRUB
+
+        # Create minimal BOOTX64.EFI that runs GRUB
+        if command -v grub-mkimage &> /dev/null; then
+            grub-mkimage \
+                -O x86_64-efi \
+                -p /EFI/grub \
+                -o "$mount_dir/boot/efi/EFI/BOOT/BOOTX64.EFI" \
+                boot chain configfile ext2 fat gzio part_gpt part_msdos normal echo \
+                2>/dev/null || log_warn "grub-mkimage failed"
+        fi
+
+        # Alternative: copy system grubx64.efi if available
+        if [ ! -f "$mount_dir/boot/efi/EFI/BOOT/BOOTX64.EFI" ]; then
+            for efi_file in /boot/efi/EFI/*/grubx64.efi /boot/efi/EFI/ubuntu/grubx64.efi /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed; do
+                if [ -f "$efi_file" ]; then
+                    mkdir -p "$mount_dir/boot/efi/EFI/BOOT"
+                    cp "$efi_file" "$mount_dir/boot/efi/EFI/BOOT/BOOTX64.EFI" 2>/dev/null && break
+                fi
+            done
+        fi
+    fi
+
+    # If we still don't have a bootloader, try to use shim
+    if [ ! -f "$mount_dir/boot/efi/EFI/BOOT/BOOTX64.EFI" ]; then
+        if command -v shim-signed &> /dev/null; then
+            log_info "Using shim-signed for EFI boot..."
+            mkdir -p "$mount_dir/boot/efi/EFI/BOOT"
+            if [ -f "/usr/lib/shim/shimx64.efi.signed" ]; then
+                cp "/usr/lib/shim/shimx64.efi.signed" "$mount_dir/boot/efi/EFI/BOOT/BOOTX64.EFI" 2>/dev/null || true
+            elif [ -f "/usr/lib/shim/shimx64.efi" ]; then
+                cp "/usr/lib/shim/shimx64.efi" "$mount_dir/boot/efi/EFI/BOOT/BOOTX64.EFI" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    # Verify EFI files exist before unmounting
+    log_info "Verifying EFI boot files..."
+    if [ -d "$mount_dir/boot/efi/EFI/BOOT" ]; then
+        log_info "EFI/BOOT directory created"
+        if [ -f "$mount_dir/boot/efi/EFI/BOOT/BOOTX64.EFI" ]; then
+            log_info "✓ BOOTX64.EFI found - Image should be UEFI bootable!"
+        else
+            log_warn "✗ BOOTX64.EFI not found - Image may not be bootable"
+        fi
+    else
+        log_warn "✗ EFI/BOOT directory not found"
+    fi
+
     # Unmount
     log_info "Cleaning up..."
     sync
+    umount "$mount_dir/boot/efi" 2>/dev/null || true
     umount "$mount_dir" 2>/dev/null || true
     losetup -d "$loop_dev" 2>/dev/null || true
     rm -rf "$mount_dir"
@@ -225,6 +339,9 @@ main() {
     echo "╔═══════════════════════════════════════════════════════════╗"
     echo "║                                                           ║"
     echo "║              Build completed successfully!               ║"
+    echo "║                                                           ║"
+    echo "║           Note: Full EFI boot requires GRUB packages      ║"
+    echo "║           Install: grub-efi-amd64, grub-efi-amd64-bin    ║"
     echo "║                                                           ║"
     echo "╚═══════════════════════════════════════════════════════════╝"
     echo ""
