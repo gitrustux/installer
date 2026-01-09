@@ -14,7 +14,7 @@ set -e
 
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+REPO_ROOT="/var/www/rustux.com/prod"
 BUILD_DIR="$SCRIPT_DIR/build"
 IMAGES_DIR="$SCRIPT_DIR/images"
 CONFIGS_DIR="$SCRIPT_DIR/configs"
@@ -122,10 +122,11 @@ collect_kernel() {
 # Collect rootfs artifacts
 collect_rootfs() {
     local arch=$1
+    local target_triple=$(echo "${ARCH_CONFIG[$arch]}" | cut -d'|' -f1)
 
     log_step "Collecting rootfs artifacts for $arch..."
 
-    local apps_src="$REPO_ROOT/apps/target/release"
+    local apps_src="$REPO_ROOT/apps/target/$target_triple/release"
     local rootfs_dst="$BUILD_DIR/rootfs"
 
     # Create basic directory structure
@@ -168,8 +169,8 @@ collect_rootfs() {
         cp -v "$apps_src/rustux-install" "$rootfs_dst/bin/rustica-installer"
     fi
 
-    # Create essential symlinks
-    ln -sf /bin/rpg "$rootfs_dst/bin/pkg"
+    # Create essential symlinks (skip pkg as it's a separate binary)
+    # ln -sf /bin/rpg "$rootfs_dst/bin/pkg"
     ln -sf /bin/editor "$rootfs_dst/bin/vi"
     ln -sf /bin/editor "$rootfs_dst/bin/nano"
 
@@ -189,7 +190,8 @@ create_initramfs() {
     mkdir -p "$initramfs_dir"/{bin,lib,proc,sys,dev,etc,root,tmp,var}
 
     # Copy essential binaries
-    cp -v "$BUILD_DIR/rootfs/bin/rustica-installer" "$initramfs_dir/bin/"
+    # Skip installer binary - use minimal init instead
+    # cp -v "$BUILD_DIR/rootfs/bin/rustica-installer" "$initramfs_dir/bin/"
 
     # Copy shell and essential tools from host
     local essential_bins=(
@@ -229,13 +231,19 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 
-echo "Rustica OS Installer"
-echo "====================="
+echo "Rustica OS v0.1.0"
+echo "================="
 echo ""
-echo "Starting installer..."
-/bin/rustica-installer
+echo "Welcome to Rustica OS!"
+echo "This is a minimal initramfs environment."
+echo ""
+echo "Available binaries in /bin:"
+ls -la /bin/
+echo ""
+echo "Dropping to shell for debugging or manual installation."
+echo ""
 
-# Shell for debugging
+# Shell for debugging and manual operation
 exec /bin/sh
 EOFINIT
 
@@ -356,51 +364,18 @@ EOFOPENSBI
 
 # Build ISO image for amd64
 build_iso_amd64() {
-    log_step "Building amd64 ISO image..."
+    log_step "Building amd64 disk image..."
 
-    local iso_dir="$BUILD_DIR/iso"
-    local iso_output="$IMAGES_DIR/rustica-installer-amd64-${VERSION}.iso"
+    # For now, build a disk image for all architectures
+    # This is simpler and more reliable than ISO creation
+    build_disk_image "amd64"
 
-    mkdir -p "$iso_dir"
-
-    # Copy bootloader and kernel
-    cp -r "$BUILD_DIR/rootfs/boot" "$iso_dir/"
-
-    # Create EFI directory structure
-    mkdir -p "$iso_dir/EFI/BOOT"
-
-    # Create GRUB EFI image
-    if command -v grub-mkrescue &> /dev/null; then
-        grub-mkrescue -o "$iso_output" \
-            --boot_catalog boot/catalog \
-            --boot-load-size 4 \
-            -V "RUSTICA_INSTALLER_AMD64" \
-            -boot-load-segment 0 \
-            -boot-catalog-hidden \
-            -boot-info-table \
-            -iso-level 3 \
-            "$iso_dir" 2>/dev/null || {
-            log_warn "grub-mkrescue failed, using genisoimage..."
-            genisoimage -o "$iso_output" \
-                -V "RUSTICA_INSTALLER_AMD64" \
-                -b boot/grub/grub_eltorito.img \
-                -no-emul-boot \
-                -boot-load-size 4 \
-                -boot-info-table \
-                -iso-level 3 \
-                "$iso_dir"
-        }
-    else
-        log_error "Neither grub-mkrescue nor genisoimage found"
-        log_warn "Creating raw disk image instead..."
-        build_disk_image "amd64"
-        return 0
-    fi
+    local disk_output="$IMAGES_DIR/rustica-installer-amd64-${VERSION}.img"
 
     # Generate checksum
-    sha256sum "$iso_output" > "${iso_output}.sha256"
+    sha256sum "$disk_output" > "${disk_output}.sha256"
 
-    log_info "amd64 ISO created: $iso_output"
+    log_info "amd64 disk image created: $disk_output"
 }
 
 # Build disk image for ARM64/RISC-V
