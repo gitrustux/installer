@@ -167,7 +167,7 @@ EOF
 
     # Build and install native UEFI bootloader
     log_step "Building native UEFI bootloader..."
-    local uefi_loader="$REPO_ROOT/uefi-loader"
+    local uefi_loader="$REPO_ROOT/kernel/uefi-loader"
     local efi_output="$mount_dir/boot/efi/EFI/BOOT"
 
     if [ -d "$uefi_loader" ]; then
