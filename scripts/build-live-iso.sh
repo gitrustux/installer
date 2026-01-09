@@ -187,6 +187,28 @@ EOF
         log_warn "UEFI loader source not found at $uefi_loader"
     fi
 
+    # Build and install UEFI kernel
+    log_step "Building UEFI kernel..."
+    local kernel_efi="$REPO_ROOT/kernel/kernel-efi"
+    local rustux_efi_dir="$mount_dir/boot/efi/EFI/Rustux"
+
+    if [ -d "$kernel_efi" ]; then
+        # Build the UEFI kernel
+        (cd "$kernel_efi" && cargo build --target x86_64-unknown-uefi --release 2>&1 | tail -10)
+
+        # Copy the built kernel EFI file
+        local kernel_file="$kernel_efi/target/x86_64-unknown-uefi/release/rustux-kernel-efi.efi"
+        if [ -f "$kernel_file" ]; then
+            mkdir -p "$rustux_efi_dir"
+            cp "$kernel_file" "$rustux_efi_dir/kernel.efi"
+            log_info "Installed kernel.efi ($(du -h "$kernel_file" | cut -f1))"
+        else
+            log_warn "UEFI kernel build not found at $kernel_file"
+        fi
+    else
+        log_warn "UEFI kernel source not found at $kernel_efi"
+    fi
+
     # Unmount
     log_info "Cleaning up..."
     sync
@@ -206,7 +228,9 @@ EOF
     local size=$(du -h "$OUTPUT_DIR/$IMG_NAME" | cut -f1)
     log_info "Image created: $OUTPUT_DIR/$IMG_NAME ($size)"
     log_info "Symlink: $OUTPUT_DIR/rustica-live-${ARCH}.img"
-    log_info "Image is now bootable via native UEFI bootloader!"
+    log_info "Image is now bootable with complete UEFI boot chain!"
+    log_info "  - BOOTX64.EFI (bootloader)"
+    log_info "  - kernel.efi (UEFI kernel)"
 }
 
 # Main
